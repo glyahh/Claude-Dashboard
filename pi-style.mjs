@@ -4,6 +4,9 @@
 
 import fs from 'node:fs';
 
+// 父进程可能在脚本写完前关掉读端；不挂这个监听，EPIPE 会变成未捕获异常并 exit 1
+process.stdout.on('error', () => {});
+
 // ── ANSI ────────────────────────────────────────────────
 const ESC = '\u001b[';
 const RESET = `${ESC}0m`;
@@ -100,6 +103,12 @@ function pctText(pct) {
 }
 
 // ── payload 解包 ────────────────────────────────────────
+// 模型名来自 env 与网关目录，可能夹带换行或 OSC 序列 —— 会撑破两行结构、让宽度算错。
+// 顺带去掉尾部的窗口标记（如 [1M]），它既不影响识别又很占地方。
+const sanitizeModel = (s) =>
+  String(s)
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+    .replace(/\[[^\]]*\]$/, '');
 function unpack(p) {
   const cw = p.context_window ?? {};
   const cache = p.prompt_cache ?? {};
@@ -121,8 +130,7 @@ function unpack(p) {
     outTok: cw.total_output_tokens ?? 0,
     hit: Number.isFinite(cache.hit_ratio) ? cache.hit_ratio * 100 : null,
     cost: p.cost?.total_cost_usd,
-    // 去掉显示名尾部的窗口标记（如 [1M]），它既不影响识别又很占地方
-    model: String(p.model?.display_name ?? p.model?.id ?? '').replace(/\[[^\]]*\]$/, ''),
+    model: sanitizeModel(p.model?.display_name ?? p.model?.id ?? ''),
     effort: p.effort?.level ?? null,
     cwd,
     transcript: p.transcript_path ?? '',
@@ -159,6 +167,7 @@ function analyzeTurns(lines) {
   const msgs = new Map();
   let prevTs = null;
   let lastModel = null;
+  let lastEffort = null;
 
   for (const line of lines) {
     if (!line) continue;
@@ -170,6 +179,7 @@ function analyzeTurns(lines) {
     if (!Number.isFinite(ts)) continue;
 
     if (r.requestedModel) lastModel = r.requestedModel;
+    if (r.effort) lastEffort = r.effort;
 
     if (r.type !== 'assistant') {
       prevTs = ts;
@@ -237,6 +247,7 @@ function analyzeTurns(lines) {
     avgTps: sumDecode > 0 ? sumOut / (sumDecode / 1000) : null,
     lastTtft: tail?.ttft ?? null,
     model: lastModel,
+    effort: lastEffort,
     tokens: { input: tIn, output: tOut, cacheRead: tCacheRead, cacheWrite: tCacheWrite },
   };
 }
@@ -281,8 +292,8 @@ const CELLS = 4;
 
 function fieldCells(c, t, a) {
   const r1 = [
-    a.input ? pair('Input', fmtTokens(t.tokens.input)) : null,
-    a.output ? pair('Output', fmtTokens(t.tokens.output)) : null,
+    a.input && t.tokens.input > 0 ? pair('Input', fmtTokens(t.tokens.input)) : null,
+    a.output && t.tokens.output > 0 ? pair('Output', fmtTokens(t.tokens.output)) : null,
     a.hit && c.hit != null ? dim('Cache hit') + ' ' + fg(hitColor(c.hit), c.hit.toFixed(1) + '%') : null,
     a.money ? pair('Cost', fmtCost(c.cost)) : null,
   ];
@@ -388,13 +399,15 @@ async function main() {
 
   const turns = analyzeTurns(readTail(c.transcript));
 
-  // payload 没带 model 时（插件、子会话上下文里常见）从 transcript 回退
-  if (!c.model && turns.model) c.model = String(turns.model).replace(/\[[^\]]*\]$/, '');
+  // payload 缺 model / effort 时（插件、子会话上下文里常见）从 transcript 回退
+  if (!c.model && turns.model) c.model = sanitizeModel(turns.model);
+  if (!c.effort && turns.effort) c.effort = turns.effort;
 
-  // 用实际模型价目重算花费，覆盖 payload 里按 Claude 价目表估出来的值。
-  // transcript 没读到内容时（会话刚起、路径无效）保留 payload 的值，别显示成 0。
+  // 用实际模型价目重算花费。transcript 读不到时（远端会话下发空路径、会话刚起）
+  // 宁可显示 "--"，也不要退回 payload 那个按 Claude 价目表估的值 —— 实测能差 55 倍。
   const tk = turns.tokens;
-  if (tk && tk.input + tk.output + tk.cacheRead + tk.cacheWrite > 0) c.cost = calcCost(tk);
+  const hasUsage = tk && tk.input + tk.output + tk.cacheRead + tk.cacheWrite > 0;
+  c.cost = hasUsage ? calcCost(tk) : null;
 
   const [l1, l2] = buildLines(c, turns, width);
   process.stdout.write(l1 + '\n' + l2);

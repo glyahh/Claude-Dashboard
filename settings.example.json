@@ -1,0 +1,7 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "node /path/to/pi-style.mjs",
+    "refreshInterval": 2
+  }
+}
